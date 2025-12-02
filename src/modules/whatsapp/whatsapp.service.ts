@@ -1,10 +1,10 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode-terminal';
 import { TicketGeneratorService } from './ticket-generator.service';
 
 @Injectable()
-export class WhatsappService implements OnModuleInit {
+export class WhatsappService {
   private client: Client;
   private readonly logger = new Logger(WhatsappService.name);
 
@@ -13,13 +13,24 @@ export class WhatsappService implements OnModuleInit {
       authStrategy: new LocalAuth({ clientId: 'bot-ventas' }),
       puppeteer: {
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/home/opc/.cache/puppeteer/chrome/linux-142.0.7444.175/chrome-linux64/chrome',
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu'
+        ],
       },
+      // FIX: Lock WhatsApp Web version to a compatible one to avoid 'getChat' undefined errors
+      webVersionCache: {
+        type: 'remote',
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+      },
+      authTimeoutMs: 60000, // Wait 60s for auth
     });
-  }
-
-  onModuleInit() {
-    this.logger.log('Inicializando cliente de WhatsApp...');
 
     this.client.on('qr', (qr: string) => {
       this.logger.warn('⚠️ ESCANEA EL CÓDIGO QR EN LA TERMINAL ⚠️');
@@ -81,14 +92,24 @@ export class WhatsappService implements OnModuleInit {
       candidateNumber = `52${candidateNumber}`;
     }
 
-    // getNumberId devuelve el ID serializado correcto (incluyendo @c.us y correcciones de 521)
-    const contact = await this.client.getNumberId(candidateNumber);
+    try {
+      // getNumberId devuelve el ID serializado correcto (incluyendo @c.us y correcciones de 521)
+      const contact = await this.client.getNumberId(candidateNumber);
 
-    if (!contact) {
-      this.logger.warn(`El número ${numero} (probado como ${candidateNumber}) no está registrado en WhatsApp.`);
-      return null;
+      if (!contact) {
+        this.logger.warn(`El número ${numero} (probado como ${candidateNumber}) no está registrado en WhatsApp.`);
+        // Fallback: Intentar construir el ID manualmente si getNumberId falla o no encuentra
+        // Para México, a veces se requiere '521' en lugar de '52' para cuentas personales
+        return `${candidateNumber}@c.us`;
+      }
+
+      return contact._serialized;
+    } catch (error) {
+      this.logger.warn(`Error al verificar número con WhatsApp (${error.message}). Usando fallback manual.`);
+      // Fallback manual ante error de Puppeteer/WidFactory
+      // Intentamos construir el ID estándar
+      return `${candidateNumber}@c.us`;
     }
-
-    return contact._serialized;
   }
 }
+

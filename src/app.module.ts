@@ -13,9 +13,9 @@ import { InventarioModule } from './modules/inventario/inventario.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { ChatbotModule } from './modules/chatbot/chatbot.module';
-import { PaymentsModule } from './modules/payments/payments.module';
+// import { PaymentsModule } from './modules/payments/payments.module';
 import { TenantsModule } from './tenants/tenants.module';
-import { WhatsappModule } from './modules/whatsapp/whatsapp.module';
+// import { WhatsappModule } from './modules/whatsapp/whatsapp.module'; // Desactivado en desarrollo local
 
 @Module({
   imports: [
@@ -42,8 +42,8 @@ import { WhatsappModule } from './modules/whatsapp/whatsapp.module';
     UsersModule,
     AuthModule,
     ChatbotModule,
-    PaymentsModule,
-    WhatsappModule,
+    // PaymentsModule,   // Desactivado: requiere credenciales Openpay
+    // WhatsappModule,   // Desactivado: requiere Chrome/Puppeteer
   ],
   controllers: [AppController],
   providers: [

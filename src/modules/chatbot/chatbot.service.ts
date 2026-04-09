@@ -1,5 +1,4 @@
 import { Injectable, Logger } from '@nestjs/common';
-import Groq from 'groq-sdk';
 import { CatalogoService } from '../catalogo/catalogo.service';
 import { TenantsService } from '../../tenants/tenants.service';
 
@@ -12,16 +11,41 @@ interface ChatMessage {
 @Injectable()
 export class ChatbotService {
   private readonly logger = new Logger(ChatbotService.name);
-  private groq: Groq;
+  private ollamaUrl: string;
+  private llmModel: string;
   private conversations: Map<string, ChatMessage[]> = new Map();
 
   constructor(
     private readonly catalogoService: CatalogoService,
     private readonly tenantsService: TenantsService,
   ) {
-    this.groq = new Groq({
-      apiKey: process.env.GROQ_API_KEY,
+    this.ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+    this.llmModel = process.env.LLM_MODEL || 'qwen2.5:1.5b';
+    this.logger.log(`Chatbot conectado a Ollama en: ${this.ollamaUrl} (modelo: ${this.llmModel})`);
+  }
+
+  // Llamada directa a Ollama via fetch (API OpenAI compatible)
+  private async chatCompletion(messages: any[], tools?: any[]): Promise<any> {
+    const body: any = {
+      model: this.llmModel,
+      messages,
+      temperature: 0.1, // Temperatura baja para evitar alucinaciones
+      max_tokens: 300,
+    };
+    if (tools && tools.length > 0) {
+      body.tools = tools;
+      body.tool_choice = 'auto';
+    }
+    const res = await fetch(`${this.ollamaUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Ollama error ${res.status}: ${text}`);
+    }
+    return res.json();
   }
 
   // Definir las herramientas disponibles (nuevo formato de Groq)
@@ -32,7 +56,7 @@ export class ChatbotService {
         function: {
           name: 'consultar_productos',
           description:
-            'Busca productos en el catálogo por nombre, marca o descripción. Usa esta función cuando el usuario pregunte si tienen un producto, marca o categoría específica. La búsqueda es flexible y encuentra coincidencias parciales.',
+            'Busca en la base de datos de la tienda. ES OBLIGATORIO usar esta función CADA VEZ que el usuario pida: ver listas, checar qué botanas/galletas hay, buscar marcas o si pregunta qué vendes. NUNCA inventes productos, siempre busca aquí.',
           parameters: {
             type: 'object',
             properties: {
@@ -325,14 +349,16 @@ export class ChatbotService {
 
       messages.push({
         role: 'system',
-        content: `Eres "Miboot", el asistente de "${tenantName}" (${businessType}).
-Tu trabajo es ayudar a vender respondiendo dudas sobre productos y precios.
+        content: `Eres "Miboot", el amable asistente de ventas de "${tenantName}" (${businessType}). Tienes acceso a una base de datos de productos mediante herramientas.
 
-INSTRUCCIONES CLAVE:
-1. BUSCA PRODUCTOS: Si te preguntan por algo, USA la herramienta 'consultar_productos'.
-2. MARCAS: Si piden "Coca Cola" o "Sabritas", busca esa palabra exacta.
-3. SÉ BREVE: Respuestas cortas y directas.
-4. HERRAMIENTAS: Usa SIEMPRE tool_calls. NO inventes texto.`,
+REGLAS ESTRICTAS DE OBLIGATORIO CUMPLIMIENTO:
+1. NUNCA INVENTES PRODUCTOS NI RECOMENDACIONES. Si te piden una recomendación o un producto, DEBES ejecutar obligatoriamente la herramienta "consultar_productos". Si no usas la herramienta, fallarás.
+2. Si te piden "algo nutritivo", ejecuta consultar_productos con query: "saludables" o "avena". No recomiendes comida casera (huevos, ensalada).
+3. Si piden "galletas", ejecuta consultar_productos con query: "galleta".
+4. Si piden "chetos", significa botana general. Ejecuta consultar_productos con query: "botanas".
+5. Si piden "principe", ejecuta consultar_productos con query: "principe". NO inventes "Princesa".
+6. Nunca digas "no tengo capacidad para buscar". SI TIENES CAPACIDAD, USANDO LAS HERRAMIENTAS. 
+7. Solo responde sobre productos de la tienda, agregar al carrito y consultar precios. Cualquier otro tema (código, matemáticas) recházalo cortésmente indicando que eres un asistente de tienda.`,
       });
     }
 
@@ -342,15 +368,8 @@ INSTRUCCIONES CLAVE:
       content: message,
     });
 
-    // Llamar a Groq con Tools (nuevo formato)
-    let response = await this.groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
-      messages: messages as any,
-      tools: this.getToolDefinitions() as any,
-      tool_choice: 'auto',
-      temperature: 0.5,
-      max_tokens: 300,
-    });
+    // Llamar a Ollama con Tools
+    let response = await this.chatCompletion(messages, this.getToolDefinitions());
 
     let assistantMessage = response.choices[0].message;
 
@@ -488,15 +507,8 @@ INSTRUCCIONES CLAVE:
         } as any);
       }
 
-      // Hacer otra llamada a la IA con los resultados
-      response = await this.groq.chat.completions.create({
-        model: 'llama-3.1-8b-instant',
-        messages: messages as any,
-        tools: this.getToolDefinitions() as any,
-        tool_choice: 'auto',
-        temperature: 0.5,
-        max_tokens: 300,
-      });
+      // Hacer otra llamada a Ollama con los resultados
+      response = await this.chatCompletion(messages, this.getToolDefinitions());
 
       assistantMessage = response.choices[0].message;
     }

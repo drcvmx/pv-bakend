@@ -8,57 +8,6 @@ interface ChatMessage {
   name?: string;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pre-clasificador de intención — sin llamada LLM extra.
-// Si el mensaje contiene estas palabras forzamos tool_choice en lugar de usar
-// 'auto', que llama3.1:8b ignora con frecuencia.
-// ─────────────────────────────────────────────────────────────────────────────
-const PRODUCT_INTENT_KEYWORDS = [
-  // Verbos de consulta
-  'tienes', 'tienen', 'hay', 'venden', 'vendes', 'existe', 'manejan',
-  'busca', 'muestra', 'lista', 'dame', 'dime', 'ver', 'mostrar',
-  // Precio
-  'precio', 'cuánto', 'cuanto', 'cuesta', 'cuestan', 'vale', 'valen', 'costo',
-  // Stock
-  'stock', 'queda', 'quedan', 'disponible', 'unidades', 'existencia',
-  // Carrito
-  'agreg', 'añad', 'pon ', 'lleva', 'quiero', 'compra', 'carrito', 'pedir',
-  // Catálogo general
-  'catálogo', 'catalogo', 'productos', 'variante', 'opciones',
-  'qué tienes', 'que tienes', 'algo de', 'tienes algo', 'tienen algo',
-  // Categorías genéricas
-  'botanas', 'galletas', 'dulces', 'bebidas', 'refrescos', 'pastelitos', 'snacks', 'saludable',
-  // Marcas del catálogo DRCV Store
-  'barcel', 'marinela', 'bimbo',
-  // Productos específicos del catálogo
-  'takis', 'gansito', 'pinguinos', 'pingüinos', 'chocoroles', 'roles',
-  'barritas', 'canelitas', 'principe', 'príncipe', 'sponch', 'triki', 'trikes',
-  'big mix', 'golden nuts', 'wapas', 'runners', 'papatinas', 'chipotles',
-  'spiga', 'bran frut', 'barras multigrano',
-  // Términos coloquiales
-  'chetos', 'sabritas', 'ruffles', 'tostitos', 'coca', 'pepsi',
-];
-
-function hasProductIntent(message: string): boolean {
-  const lower = message.toLowerCase();
-  return PRODUCT_INTENT_KEYWORDS.some((kw) => lower.includes(kw));
-}
-
-// Inferir la tool más específica según el texto del usuario.
-function inferTool(message: string): string {
-  const lower = message.toLowerCase();
-  if (/agreg|añad|llévame|llevame|quiero\s+\d|dame\s+\d|pon\s+\d|compra/.test(lower)) {
-    return 'agregar_al_carrito';
-  }
-  if (/precio|cuánto|cuanto|cuesta|cuestan|vale|valen|costo/.test(lower)) {
-    return 'consultar_precio';
-  }
-  if (/stock|queda|quedan|disponible|unidades|existencia|cuántos|cuantos/.test(lower)) {
-    return 'consultar_stock';
-  }
-  return 'consultar_productos';
-}
-
 @Injectable()
 export class ChatbotService {
   private readonly logger = new Logger(ChatbotService.name);
@@ -71,27 +20,21 @@ export class ChatbotService {
     private readonly tenantsService: TenantsService,
   ) {
     this.ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-    this.llmModel = process.env.LLM_MODEL || 'llama3.1:8b';
-    this.logger.log(
-      `Chatbot conectado a Ollama: ${this.ollamaUrl} (modelo: ${this.llmModel})`,
-    );
+    this.llmModel = process.env.LLM_MODEL || 'qwen2.5:1.5b';
+    this.logger.log(`Chatbot conectado a Ollama en: ${this.ollamaUrl} (modelo: ${this.llmModel})`);
   }
 
-  // toolChoice: 'auto' | 'required' | 'none' | { type: 'function', function: { name } }
-  private async chatCompletion(
-    messages: any[],
-    tools?: any[],
-    toolChoice: any = 'auto',
-  ): Promise<any> {
+  // Llamada directa a Ollama via fetch (API OpenAI compatible)
+  private async chatCompletion(messages: any[], tools?: any[]): Promise<any> {
     const body: any = {
       model: this.llmModel,
       messages,
-      temperature: 0.1,
-      max_tokens: 600,
+      temperature: 0.1, // Temperatura baja para evitar alucinaciones
+      max_tokens: 300,
     };
     if (tools && tools.length > 0) {
       body.tools = tools;
-      body.tool_choice = toolChoice;
+      body.tool_choice = 'auto';
     }
     const res = await fetch(`${this.ollamaUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -105,6 +48,7 @@ export class ChatbotService {
     return res.json();
   }
 
+  // Definir las herramientas disponibles (nuevo formato de Groq)
   private getToolDefinitions() {
     return [
       {
@@ -112,14 +56,14 @@ export class ChatbotService {
         function: {
           name: 'consultar_productos',
           description:
-            'Busca productos en el catálogo por nombre, categoría o marca. ' +
-            'Usar cuando el usuario pregunta qué hay, qué tienes, o menciona cualquier producto o marca.',
+            'Busca en la base de datos de la tienda. ES OBLIGATORIO usar esta función CADA VEZ que el usuario pida: ver listas, checar qué botanas/galletas hay, buscar marcas o si pregunta qué vendes. NUNCA inventes productos, siempre busca aquí.',
           parameters: {
             type: 'object',
             properties: {
               query: {
                 type: 'string',
-                description: 'Término de búsqueda. Ej: "barcel", "galletas", "takis", "marinela".',
+                description:
+                  'Término de búsqueda: puede ser nombre del producto, marca, o palabra clave (ej: "coca cola", "sabritas", "leche", "botana")',
               },
             },
             required: ['query'],
@@ -131,12 +75,14 @@ export class ChatbotService {
         function: {
           name: 'consultar_stock',
           description:
-            'Consulta unidades disponibles de un producto. ' +
-            'Usar cuando preguntan si hay existencias o cuántos quedan.',
+            'Consulta el stock disponible de un producto específico. Usa esta función cuando el usuario pregunte cuántas unidades hay o si hay disponibilidad.',
           parameters: {
             type: 'object',
             properties: {
-              producto_nombre: { type: 'string', description: 'Nombre del producto.' },
+              producto_nombre: {
+                type: 'string',
+                description: 'Nombre del producto para consultar stock',
+              },
             },
             required: ['producto_nombre'],
           },
@@ -146,11 +92,15 @@ export class ChatbotService {
         type: 'function',
         function: {
           name: 'consultar_precio',
-          description: 'Consulta el precio de un producto.',
+          description:
+            'Consulta el precio de un producto específico. Usa esta función cuando el usuario pregunte cuánto cuesta un producto.',
           parameters: {
             type: 'object',
             properties: {
-              producto_nombre: { type: 'string', description: 'Nombre del producto.' },
+              producto_nombre: {
+                type: 'string',
+                description: 'Nombre del producto para consultar precio',
+              },
             },
             required: ['producto_nombre'],
           },
@@ -161,13 +111,18 @@ export class ChatbotService {
         function: {
           name: 'agregar_al_carrito',
           description:
-            'Agrega un producto al carrito. ' +
-            'Usar SOLO cuando el usuario pide explícitamente agregar, comprar o llevar.',
+            'Agrega un producto al carrito de compras. Usa esta función cuando el usuario explícitamente pida agregar, comprar o llevar un producto.',
           parameters: {
             type: 'object',
             properties: {
-              producto_nombre: { type: 'string', description: 'Nombre del producto.' },
-              cantidad: { type: 'number', description: 'Cantidad. Default: 1.' },
+              producto_nombre: {
+                type: 'string',
+                description: 'Nombre del producto a agregar',
+              },
+              cantidad: {
+                type: 'number',
+                description: 'Cantidad a agregar (por defecto 1)',
+              },
             },
             required: ['producto_nombre'],
           },
@@ -176,119 +131,148 @@ export class ChatbotService {
     ];
   }
 
-  private buildSystemPrompt(tenantName: string, businessType: string): string {
-    return `Eres Miboot, asistente de ventas de "${tenantName}" (${businessType}).
-
-REGLA ABSOLUTA: Toda información sobre productos DEBE venir de las herramientas. Nunca uses tu conocimiento interno sobre marcas, precios o productos. Si no llamas una herramienta, no sabes qué hay en esta tienda.
-
-CUÁNDO USAR CADA HERRAMIENTA:
-- Cualquier pregunta sobre productos, marcas o categorías → consultar_productos(query)
-- Pregunta de precio → consultar_precio(producto_nombre)
-- Pregunta de disponibilidad/stock → consultar_stock(producto_nombre)
-- Usuario quiere agregar/comprar/llevar → agregar_al_carrito(producto_nombre, cantidad)
-
-EJEMPLOS DE COMPORTAMIENTO CORRECTO:
-User: "tienes algo de barcel?"
-→ Llamas consultar_productos(query: "barcel")
-→ Respondes SOLO con lo que devolvió la herramienta
-
-User: "qué botanas tienes?"
-→ Llamas consultar_productos(query: "botanas")
-→ Respondes SOLO con los productos del resultado
-
-User: "cuánto cuesta la barrita?"
-→ Llamas consultar_precio(producto_nombre: "barrita")
-→ Respondes con el precio exacto del resultado
-
-User: "agrégame 2 takis fuego"
-→ Llamas agregar_al_carrito(producto_nombre: "takis fuego", cantidad: 2)
-→ Confirmas con el nombre exacto que devolvió la herramienta
-
-PROHIBIDO:
-- Decir "no tengo la capacidad para buscar" — siempre tienes las herramientas disponibles
-- Inventar productos, precios o marcas de tu memoria
-- Recomendar sin antes consultar el catálogo
-- Responder temas fuera de la tienda (código, matemáticas, etc.)
-
-Responde en español, de forma breve y amable.`;
-  }
-
+  // Ejecutar función basado en el nombre
   private async executeFunction(
     tenantId: string,
     functionName: string,
     args: any,
   ): Promise<string> {
-    this.logger.log(`Tool call: ${functionName}`, args);
+    this.logger.log(`Executing function: ${functionName} with args:`, args);
+
     try {
       switch (functionName) {
         case 'consultar_productos':
           return await this.consultarProductos(tenantId, args.query);
+
         case 'consultar_stock':
           return await this.consultarStock(tenantId, args.producto_nombre);
+
         case 'consultar_precio':
           return await this.consultarPrecio(tenantId, args.producto_nombre);
+
         case 'agregar_al_carrito':
-          return await this.agregarAlCarrito(tenantId, args.producto_nombre, args.cantidad || 1);
+          return await this.agregarAlCarrito(
+            tenantId,
+            args.producto_nombre,
+            args.cantidad || 1,
+          );
+
         default:
           return JSON.stringify({ error: 'Función no encontrada' });
       }
     } catch (error: any) {
-      this.logger.error(`Error en ${functionName}:`, error);
-      return JSON.stringify({ error: 'Error al ejecutar la función', details: error?.message });
+      this.logger.error(`Error executing function ${functionName}:`, error);
+      return JSON.stringify({
+        error: 'Error al ejecutar la función',
+        details: error?.message || 'Unknown error',
+      });
     }
   }
 
-  private async consultarProductos(tenantId: string, query: string): Promise<string> {
+  // Implementación de las funciones
+  private async consultarProductos(
+    tenantId: string,
+    query: string,
+  ): Promise<string> {
     const productos = await this.catalogoService.search(tenantId, query);
+
     if (!productos || productos.length === 0) {
-      return JSON.stringify({ found: false, message: `No hay productos para: "${query}".` });
+      return JSON.stringify({
+        found: false,
+        message: 'No se encontraron productos que coincidan con la búsqueda.',
+      });
     }
+
+    const productosInfo = productos.map((p) => ({
+      nombre: p.nombre,
+      descripcion: p.descripcion,
+      variantes: p.variantes?.map((v) => ({
+        id: v.id,
+        nombre: v.nombreVariante,
+        precio: `$${Number(v.precio).toFixed(2)}`,
+        unidad: v.unidadMedida,
+        stock:
+          v.inventario?.reduce(
+            (sum: number, inv: any) => sum + Number(inv.cantidad || 0),
+            0,
+          ) || 0,
+        disponible:
+          (v.inventario?.reduce(
+            (sum: number, inv: any) => sum + Number(inv.cantidad || 0),
+            0,
+          ) || 0) > 0,
+      })),
+    }));
+
     return JSON.stringify({
       found: true,
       count: productos.length,
-      productos: productos.map((p) => ({
-        nombre: p.nombre,
-        marca: p.marca,
-        categoria: p.categoria,
-        variantes: p.variantes?.map((v) => ({
-          id: v.id,
-          nombre: v.nombreVariante,
-          precio: `$${Number(v.precio).toFixed(2)}`,
-          unidad: v.unidadMedida,
-          stock: v.inventario?.reduce((s: number, i: any) => s + Number(i.cantidad || 0), 0) || 0,
-          disponible: (v.inventario?.reduce((s: number, i: any) => s + Number(i.cantidad || 0), 0) || 0) > 0,
-        })),
-      })),
+      mensaje: `Se encontraron ${productos.length} producto(s)`,
+      productos: productosInfo,
     });
   }
 
-  private async consultarStock(tenantId: string, productoNombre: string): Promise<string> {
-    const productos = await this.catalogoService.search(tenantId, productoNombre);
-    if (!productos?.length) return JSON.stringify({ found: false, message: 'Producto no encontrado.' });
+  private async consultarStock(
+    tenantId: string,
+    productoNombre: string,
+  ): Promise<string> {
+    const productos = await this.catalogoService.search(
+      tenantId,
+      productoNombre,
+    );
+
+    if (!productos || productos.length === 0) {
+      return JSON.stringify({
+        found: false,
+        message: 'Producto no encontrado.',
+      });
+    }
+
     const producto = productos[0];
+    const stockInfo = producto.variantes?.map((v) => ({
+      variante: v.nombreVariante,
+      stock:
+        v.inventario?.reduce(
+          (sum: number, inv: any) => sum + Number(inv.cantidad || 0),
+          0,
+        ) || 0,
+      unidad: v.unidadMedida,
+    }));
+
     return JSON.stringify({
       found: true,
       producto: producto.nombre,
-      stock: producto.variantes?.map((v) => ({
-        variante: v.nombreVariante,
-        stock: v.inventario?.reduce((s: number, i: any) => s + Number(i.cantidad || 0), 0) || 0,
-        unidad: v.unidadMedida,
-      })),
+      stock: stockInfo,
     });
   }
 
-  private async consultarPrecio(tenantId: string, productoNombre: string): Promise<string> {
-    const productos = await this.catalogoService.search(tenantId, productoNombre);
-    if (!productos?.length) return JSON.stringify({ found: false, message: 'Producto no encontrado.' });
+  private async consultarPrecio(
+    tenantId: string,
+    productoNombre: string,
+  ): Promise<string> {
+    const productos = await this.catalogoService.search(
+      tenantId,
+      productoNombre,
+    );
+
+    if (!productos || productos.length === 0) {
+      return JSON.stringify({
+        found: false,
+        message: 'Producto no encontrado.',
+      });
+    }
+
     const producto = productos[0];
+    const preciosInfo = producto.variantes?.map((v) => ({
+      variante: v.nombreVariante,
+      precio: v.precio,
+      unidad: v.unidadMedida,
+    }));
+
     return JSON.stringify({
       found: true,
       producto: producto.nombre,
-      precios: producto.variantes?.map((v) => ({
-        variante: v.nombreVariante,
-        precio: v.precio,
-        unidad: v.unidadMedida,
-      })),
+      precios: preciosInfo,
     });
   }
 
@@ -297,18 +281,33 @@ Responde en español, de forma breve y amable.`;
     productoNombre: string,
     cantidad: number,
   ): Promise<string> {
-    const productos = await this.catalogoService.search(tenantId, productoNombre);
-    if (!productos?.length) {
-      return JSON.stringify({ found: false, message: 'Producto no encontrado.' });
+    const productos = await this.catalogoService.search(
+      tenantId,
+      productoNombre,
+    );
+
+    if (!productos || productos.length === 0) {
+      return JSON.stringify({
+        found: false,
+        message: 'Producto no encontrado. No se pudo agregar al carrito.',
+      });
     }
+
+    // Tomar el primer producto y su primera variante por defecto
+    // Idealmente la IA podría preguntar por variantes, pero por ahora simplificamos
     const producto = productos[0];
     const variante = producto.variantes?.[0];
+
     if (!variante) {
-      return JSON.stringify({ found: true, message: 'El producto no tiene variantes disponibles.' });
+      return JSON.stringify({
+        found: true,
+        message: 'El producto no tiene variantes disponibles para venta.',
+      });
     }
+
     return JSON.stringify({
       found: true,
-      message: `Agregué ${cantidad} × ${producto.nombre} (${variante.nombreVariante}) al carrito.`,
+      message: `He agregado ${cantidad} ${producto.nombre} (${variante.nombreVariante}) al carrito.`,
       clientAction: {
         type: 'ADD_TO_CART',
         payload: {
@@ -322,79 +321,20 @@ Responde en español, de forma breve y amable.`;
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Extrae argumentos del texto del usuario para el fallback manual.
-  // Limpia frases de acción y stopwords, dejando solo el nombre del producto.
-  // ─────────────────────────────────────────────────────────────────────────
-  private extractArgsFromMessage(message: string, toolName: string): any {
-    const cantidadMatch = message.match(/\b(\d+)\b/);
-    const cantidad = cantidadMatch ? parseInt(cantidadMatch[1]) : 1;
-
-    let query = message.toLowerCase();
-
-    // Paso 1: eliminar frases de acción completas (orden: más largas primero)
-    const ACTION_PHRASES = [
-      'agregar al carrito', 'al carrito', 'en el carrito', 'del carrito',
-      'agrégame', 'agregame', 'agrégueme', 'agregueme',
-      'añádeme', 'anademe', 'añade', 'anade',
-      'llévame', 'llevame', 'llévatelo', 'llevatelo',
-      'quiero comprar', 'quiero pedir', 'quiero',
-      'dame', 'pon', 'ponme',
-      'comprar', 'compra', 'pedir', 'pide', 'necesito',
-      'por favor', 'porfavor', 'porfa', 'please',
-      'agrega', 'agregar',
-      'tienes', 'tienen', 'hay', 'muestrame', 'muéstrame',
-      'buscar', 'busca', 'ver',
-      'cuánto cuesta', 'cuanto cuesta', 'cuánto cuestan', 'cuanto cuestan',
-      'cuánto vale', 'cuanto vale',
-      'precio de', 'el precio',
-      'algo de', 'algo',
-    ];
-    ACTION_PHRASES.sort((a, b) => b.length - a.length);
-    ACTION_PHRASES.forEach((phrase) => {
-      query = query.replace(new RegExp(phrase, 'gi'), ' ');
-    });
-
-    // Paso 2: quitar artículos y preposiciones
-    const STOPWORDS = [
-      'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas',
-      'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
-      'qué', 'que', 'me', 'te', 'le', 'nos', 'se',
-      'unidad', 'unidades', 'pieza', 'piezas', 'bolsa', 'bolsas', 'paquete',
-    ];
-    STOPWORDS.forEach((sw) => {
-      query = query.replace(new RegExp(`\\b${sw}\\b`, 'gi'), ' ');
-    });
-
-    // Paso 3: quitar número de cantidad
-    if (cantidad > 0) {
-      query = query.replace(new RegExp(`\\b${cantidad}\\b`, 'g'), ' ');
-    }
-
-    // Paso 4: limpiar puntuación y espacios múltiples
-    query = query.replace(/[¿?¡!,\.;:]/g, ' ').replace(/\s+/g, ' ').trim();
-
-    this.logger.debug(`extractArgs: "${message}" → "${query}" (cantidad: ${cantidad})`);
-
-    if (toolName === 'agregar_al_carrito') return { producto_nombre: query, cantidad };
-    if (toolName === 'consultar_precio')   return { producto_nombre: query };
-    if (toolName === 'consultar_stock')    return { producto_nombre: query };
-    return { query: query || 'productos' };
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Método principal
-  // ─────────────────────────────────────────────────────────────────────────
+  // Método principal para procesar mensajes del chat
   async processMessage(
     tenantId: string,
     message: string,
     conversationId?: string,
   ): Promise<{ response: string; conversationId: string; actions?: any[] }> {
+    // Obtener o crear historial de conversación
     const convId = conversationId || this.generateConversationId();
     let messages = this.conversations.get(convId) || [];
     const collectedActions: any[] = [];
 
+    // Si es nueva conversación, agregar mensaje del sistema con contexto del tenant
     if (messages.length === 0) {
+      // Obtener información del tenant
       let tenantName = 'la tienda';
       let businessType = 'comercio';
       try {
@@ -403,151 +343,195 @@ Responde en español, de forma breve y amable.`;
           tenantName = tenant.nombre;
           businessType = tenant.tipoNegocio || 'comercio';
         }
-      } catch (_) {
+      } catch (e) {
         this.logger.warn(`Could not fetch tenant info for ${tenantId}`);
       }
-      messages.push({ role: 'system', content: this.buildSystemPrompt(tenantName, businessType) });
+
+      messages.push({
+        role: 'system',
+        content: `Eres "Miboot", el amable asistente de ventas de "${tenantName}" (${businessType}). Tienes acceso a una base de datos de productos mediante herramientas.
+
+REGLAS ESTRICTAS DE OBLIGATORIO CUMPLIMIENTO:
+1. NUNCA INVENTES PRODUCTOS NI RECOMENDACIONES. Si te piden una recomendación, producto, o MARCA, DEBES ejecutar obligatoriamente la herramienta "consultar_productos". 
+2. Si preguntan "¿vendes [marca]?" (ej: Marinela, Barcel, Bimbo), ejecuta consultar_productos con query: "[marca]".
+3. Si te preguntan "¿qué marcas tienes?" o "¿qué vendes?", ejecuta consultar_productos con query: "a" o "e" para ver el catálogo y menciona las marcas/productos que veas en los resultados resultantes.
+4. Si piden "chetos", significa botana general. Ejecuta consultar_productos con query: "botanas".
+5. Si piden "principe", ejecuta consultar_productos con query: "principe". NO inventes "Princesa".
+6. Nunca digas "no tengo información" o "no puedo buscar". SI TIENES CAPACIDAD. ESTÁS OBLIGADO A USAR LA HERRAMIENTA consultar_productos.
+7. Solo responde sobre productos de la tienda, agregar al carrito y consultar precios. Cualquier otro tema recházalo cortésmente.`,
+      });
     }
 
-    messages.push({ role: 'user', content: message });
+    // Agregar mensaje del usuario
+    messages.push({
+      role: 'user',
+      content: message,
+    });
 
-    // ── Paso 1: Pre-clasificar intención y forzar tool_choice ─────────────
-    const needsTools = hasProductIntent(message);
-    let toolChoice: any = 'auto';
-    let forcedTool: string | null = null;
+    // Llamar a Ollama con Tools
+    let response = await this.chatCompletion(messages, this.getToolDefinitions());
 
-    if (needsTools) {
-      forcedTool = inferTool(message);
-      toolChoice = { type: 'function', function: { name: forcedTool } };
-      this.logger.log(`Pre-classifier → forcing tool: ${forcedTool}`);
-    }
-
-    let response = await this.chatCompletion(messages, this.getToolDefinitions(), toolChoice);
     let assistantMessage = response.choices[0].message;
 
-    // ── Corrección: alucinación de tags XML <function=...> ────────────────
-    if (assistantMessage.content?.includes('<function=')) {
+    // --- CORRECCIÓN DE ALUCINACIONES DE FORMATO ---
+    // A veces el modelo alucina tags XML como <function=...> en lugar de usar tool_calls
+    if (assistantMessage.content && assistantMessage.content.includes('<function=')) {
       try {
         const regex = /<function=(\w+)(?:=\[\])?(\{.*?\})?<\/function>/g;
-        const newToolCalls: any[] = [];
-        let cleanContent = assistantMessage.content;
         let match;
+        const newToolCalls = [];
+        let cleanContent = assistantMessage.content;
+
         while ((match = regex.exec(assistantMessage.content)) !== null) {
-          let fixedJson = match[2] || '{}';
-          if (!fixedJson.startsWith('{')) fixedJson = '{' + fixedJson;
-          if (!fixedJson.endsWith('}')) fixedJson = fixedJson + '}';
-          newToolCalls.push({
-            id: `call_fix_${Date.now()}_${Math.random()}`,
-            type: 'function',
-            function: { name: match[1], arguments: fixedJson },
-          });
-          cleanContent = cleanContent.replace(match[0], '');
+          const functionName = match[1];
+          const jsonArgs = match[2] || '{}';
+
+          try {
+            // Intentar arreglar JSON malformado común
+            let fixedJson = jsonArgs;
+            if (!fixedJson.startsWith('{')) fixedJson = '{' + fixedJson;
+            if (!fixedJson.endsWith('}')) fixedJson = fixedJson + '}';
+
+            newToolCalls.push({
+              id: 'call_fix_' + Date.now() + Math.random(),
+              type: 'function',
+              function: {
+                name: functionName,
+                arguments: fixedJson
+              }
+            });
+
+            // Remover el tag del contenido visible
+            cleanContent = cleanContent.replace(match[0], '');
+          } catch (e) {
+            this.logger.warn(`Failed to parse hallucinated function args: ${jsonArgs}`);
+          }
         }
+
         if (newToolCalls.length > 0) {
-          this.logger.log(`Fixed ${newToolCalls.length} hallucinated XML tool calls`);
-          assistantMessage.tool_calls = newToolCalls;
-          assistantMessage.content = cleanContent.trim() || null;
+          this.logger.log(`Fixed ${newToolCalls.length} hallucinated tool calls`);
+          assistantMessage.tool_calls = newToolCalls as any;
+          assistantMessage.content = cleanContent.trim() || null; // Si solo había tags, dejar null
         }
       } catch (e) {
-        this.logger.error('Error fixing hallucinated XML tags', e);
+        this.logger.error('Error fixing hallucinated tags', e);
       }
     }
 
-    // ── Corrección: JSON plano en content ─────────────────────────────────
-    if (!assistantMessage.tool_calls?.length && assistantMessage.content?.trim().startsWith('{')) {
+    // Fallback: Si el modelo devuelve un JSON en el contenido en lugar de tool_calls nativos
+    if (
+      (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) &&
+      assistantMessage.content &&
+      assistantMessage.content.trim().startsWith('{')
+    ) {
       try {
-        const clean = assistantMessage.content.trim().replace(/^```json\s*|\s*```$/g, '');
-        const json = JSON.parse(clean);
+        const content = assistantMessage.content.trim();
+        // Intentar limpiar bloques de código markdown si existen
+        const cleanContent = content.replace(/^```json\s*|\s*```$/g, '');
+        const json = JSON.parse(cleanContent);
+
         if (json.function && json.parameters) {
-          assistantMessage.tool_calls = [{
-            id: `call_${Date.now()}`,
-            type: 'function',
-            function: { name: json.function, arguments: JSON.stringify(json.parameters) },
-          }];
-          assistantMessage.content = null;
+          assistantMessage.tool_calls = [
+            {
+              id: 'call_' + Date.now(),
+              type: 'function',
+              function: {
+                name: json.function,
+                arguments: JSON.stringify(json.parameters),
+              },
+            },
+          ] as any;
+          assistantMessage.content = null; // Limpiar contenido para evitar mostrar el JSON
         }
-      } catch (_) {}
+      } catch (e) {
+        // No es un JSON válido o no tiene el formato esperado, continuar normal
+      }
     }
 
-    // ── Fallback: el modelo ignoró tool_choice forzado ────────────────────
-    if (needsTools && forcedTool && !assistantMessage.tool_calls?.length) {
-      this.logger.warn(`Model ignored forced tool_choice. Executing ${forcedTool} manually.`);
-      const args = this.extractArgsFromMessage(message, forcedTool);
-      const functionResult = await this.executeFunction(tenantId, forcedTool, args);
-
-      try {
-        const resultJson = JSON.parse(functionResult);
-        if (resultJson.clientAction) collectedActions.push(resultJson.clientAction);
-      } catch (_) {}
-
-      const callId = `call_manual_${Date.now()}`;
-      messages.push({
-        role: 'assistant' as const,
-        content: null as any,
-        tool_calls: [{ id: callId, type: 'function', function: { name: forcedTool, arguments: JSON.stringify(args) } }],
-      } as any);
-      messages.push({ role: 'tool' as any, tool_call_id: callId, content: functionResult } as any);
-
-      response = await this.chatCompletion(messages, this.getToolDefinitions(), 'none');
-      assistantMessage = response.choices[0].message;
-
-      const finalContent = assistantMessage.content || 'Lo siento, no pude procesar tu solicitud.';
-      messages.push({ role: 'assistant', content: finalContent });
-      if (messages.length > 21) messages = [messages[0], ...messages.slice(-20)];
-      this.conversations.set(convId, messages);
-      this.cleanOldConversations();
-      return {
-        response: finalContent,
-        conversationId: convId,
-        actions: collectedActions.length > 0 ? collectedActions : undefined,
-      };
-    }
-
-    // ── Loop de herramientas normal ───────────────────────────────────────
+    // Si la IA decidió llamar una herramienta
     let toolLoopCount = 0;
     const MAX_TOOL_LOOPS = 5;
 
-    while (assistantMessage.tool_calls?.length > 0 && toolLoopCount < MAX_TOOL_LOOPS) {
+    while (
+      assistantMessage.tool_calls &&
+      assistantMessage.tool_calls.length > 0 &&
+      toolLoopCount < MAX_TOOL_LOOPS
+    ) {
       toolLoopCount++;
-
+      if (toolLoopCount === MAX_TOOL_LOOPS) {
+        this.logger.warn('Max tool loop iterations reached. Stopping recursion.');
+      }
+      // Agregar el mensaje del asistente con TODOS los tool_calls
       messages.push({
         role: 'assistant',
         content: assistantMessage.content || '',
         tool_calls: assistantMessage.tool_calls,
       } as any);
 
+      // Procesar cada tool call
       for (const toolCall of assistantMessage.tool_calls) {
+        const functionName = toolCall.function.name;
         let functionArgs = {};
+
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
-        } catch (_) {
-          this.logger.error(`Bad args for ${toolCall.function.name}: ${toolCall.function.arguments}`);
+        } catch (e) {
+          this.logger.error(`Failed to parse arguments for ${functionName}: ${toolCall.function.arguments}`);
+          // Intentar recuperación básica si es posible, o dejar vacío
         }
 
-        const functionResult = await this.executeFunction(tenantId, toolCall.function.name, functionArgs);
+        this.logger.log(`AI wants to call: ${functionName}`);
 
+        // Ejecutar la función
+        const functionResult = await this.executeFunction(
+          tenantId,
+          functionName,
+          functionArgs,
+        );
+
+        // Verificar si hay acciones del cliente en el resultado
         try {
           const resultJson = JSON.parse(functionResult);
-          if (resultJson.clientAction) collectedActions.push(resultJson.clientAction);
-        } catch (_) {}
+          if (resultJson.clientAction) {
+            collectedActions.push(resultJson.clientAction);
+          }
+        } catch (e) {
+          // Ignorar error de parseo si no es JSON
+        }
 
-        messages.push({ role: 'tool' as any, tool_call_id: toolCall.id, content: functionResult } as any);
+        // Agregar el resultado de la herramienta
+        messages.push({
+          role: 'tool' as any,
+          tool_call_id: toolCall.id,
+          content: functionResult,
+        } as any);
       }
 
-      // 'none' para que no entre en loop infinito de tools
-      response = await this.chatCompletion(messages, this.getToolDefinitions(), 'none');
+      // Hacer otra llamada a Ollama con los resultados
+      response = await this.chatCompletion(messages, this.getToolDefinitions());
+
       assistantMessage = response.choices[0].message;
     }
 
-    const finalContent = assistantMessage.content || 'Lo siento, no pude procesar tu solicitud.';
-    messages.push({ role: 'assistant', content: finalContent });
+    // Agregar respuesta final al historial
+    messages.push({
+      role: 'assistant',
+      content:
+        assistantMessage.content || 'Lo siento, no pude procesar tu solicitud.',
+    });
 
-    if (messages.length > 21) messages = [messages[0], ...messages.slice(-20)];
+    // Guardar conversación (limitar a últimos 20 mensajes para no sobrecargar)
+    if (messages.length > 20) {
+      messages = [messages[0], ...messages.slice(-19)]; // Mantener system prompt + últimos 19
+    }
     this.conversations.set(convId, messages);
+
+    // Limpiar conversaciones viejas (más de 1 hora)
     this.cleanOldConversations();
 
     return {
-      response: finalContent,
+      response:
+        assistantMessage.content || 'Lo siento, no pude procesar tu solicitud.',
       conversationId: convId,
       actions: collectedActions.length > 0 ? collectedActions : undefined,
     };
@@ -558,9 +542,13 @@ Responde en español, de forma breve y amable.`;
   }
 
   private cleanOldConversations() {
+    // Limpiar conversaciones cada cierto tiempo
+    // Por simplicidad, mantener solo las últimas 50
     if (this.conversations.size > 50) {
       const keys = Array.from(this.conversations.keys());
-      keys.slice(0, this.conversations.size - 50).forEach((k) => this.conversations.delete(k));
+      const toDelete = keys.slice(0, this.conversations.size - 50);
+      toDelete.forEach((key) => this.conversations.delete(key));
     }
   }
 }
+
